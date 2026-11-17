@@ -73,9 +73,11 @@ export default function App() {
   const [generatingSegmentId, setGeneratingSegmentId] = useState<string | null>(null);
   const [generatingCueId, setGeneratingCueId] = useState<string | null>(null);
   const [generationError, setGenerationError] = useState<string | null>(null);
+  const [cooldownSec, setCooldownSec] = useState<number>(0);
   const [fullAudioBase64, setFullAudioBase64] = useState<string | null>(null);
   const [segmentAudioMap, setSegmentAudioMap] = useState<Record<string, string>>({});
   const [cueTimingsMap, setCueTimingsMap] = useState<Record<string, CueTimingResult>>({});
+  const isRequestInFlightRef = useRef<boolean>(false);
 
   // Modals & tabs
   const [isExportModalOpen, setIsExportModalOpen] = useState<boolean>(false);
@@ -193,6 +195,21 @@ export default function App() {
     }
   };
 
+  // Cooldown countdown timer for 429 rate-limit recovery
+  useEffect(() => {
+    if (cooldownSec <= 0) return;
+    const timer = setInterval(() => {
+      setCooldownSec((prev) => {
+        if (prev <= 1) {
+          setGenerationError(null);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [cooldownSec]);
+
   // Generate Timed Multi-Cue Master WAV for LED Video Demo
   const handleGenerateTimedDemo = async (
     voiceOverride?: VoiceOption,
@@ -200,12 +217,15 @@ export default function App() {
     styleOverride?: string,
     cuesOverride?: TimedCue[]
   ) => {
+    if (isRequestInFlightRef.current || cooldownSec > 0) return;
+
     const activeVoice = voiceOverride || selectedVoice;
     const activeAccent = accentOverride || selectedAccent;
     const activeStyle = styleOverride || selectedStyle;
     const cuesToUse = cuesOverride || timedCues;
 
     try {
+      isRequestInFlightRef.current = true;
       setIsGenerating(true);
       setGenerationError(null);
 
@@ -229,12 +249,14 @@ export default function App() {
           voiceName: activeVoice.baseVoice,
           style: instruction,
           accent: activeVoice.accent.toLowerCase(),
-          trimSilence: true,
         }),
       });
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
+        if (response.status === 429) {
+          setCooldownSec(errorData.retryAfterSec || 30);
+        }
         throw new Error(errorData.error || `Server responded with ${response.status}`);
       }
 
@@ -263,6 +285,7 @@ export default function App() {
       console.error('Failed to generate timed voiceover:', err);
       setGenerationError(err.message || 'Error generating timed AI voiceover.');
     } finally {
+      isRequestInFlightRef.current = false;
       setIsGenerating(false);
     }
   };
@@ -274,12 +297,15 @@ export default function App() {
     styleOverride?: string,
     textOverride?: string
   ) => {
+    if (isRequestInFlightRef.current || cooldownSec > 0) return;
+
     const activeVoice = voiceOverride || selectedVoice;
     const activeAccent = accentOverride || selectedAccent;
     const activeStyle = styleOverride || selectedStyle;
     const textToSpeak = textOverride ?? scriptText;
 
     try {
+      isRequestInFlightRef.current = true;
       setIsGenerating(true);
       setGenerationError(null);
 
@@ -305,6 +331,9 @@ export default function App() {
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
+        if (response.status === 429) {
+          setCooldownSec(errorData.retryAfterSec || 30);
+        }
         throw new Error(errorData.error || `Server responded with ${response.status}`);
       }
 
@@ -325,6 +354,7 @@ export default function App() {
       console.error('Failed to generate full audio:', err);
       setGenerationError(err.message || 'Error generating AI speech. Check API configuration.');
     } finally {
+      isRequestInFlightRef.current = false;
       setIsGenerating(false);
     }
   };
@@ -350,12 +380,6 @@ export default function App() {
     setActiveSingleCueId(null);
     setActiveSegmentAudioIndex(null);
     setProjectMode(mode);
-
-    if (mode === 'led-video-demo') {
-      handleGenerateTimedDemo();
-    } else {
-      handleGenerateFullAudio();
-    }
   };
 
   // Handle language switch (Walkthrough mode)
@@ -369,9 +393,6 @@ export default function App() {
     }
     const nextText = lang === 'hi' ? HINDI_DEFAULT_SCRIPT : FULL_DEFAULT_SCRIPT;
     setScriptText(nextText);
-    if (projectMode === 'full-walkthrough') {
-      handleGenerateFullAudio(undefined, undefined, undefined, nextText);
-    }
   };
 
   // Play a single timed cue
@@ -653,10 +674,7 @@ export default function App() {
     document.body.removeChild(link);
   };
 
-  // Auto-generate Timed LED Demo voiceover on initial load
-  useEffect(() => {
-    handleGenerateTimedDemo();
-  }, []);
+  // Do not auto-consume TTS API quota on mount; user clicks Generate Voice or Play Narration on demand.
 
   // Build active DeviceSimulator segment from either project mode
   const activeCue = timedCues[activeCueIndex] || timedCues[0];
@@ -747,9 +765,9 @@ export default function App() {
 
             <button
               onClick={handleGenerateActiveProject}
-              disabled={isGenerating}
+              disabled={isGenerating || cooldownSec > 0}
               className={`px-4 py-1.5 rounded-lg text-xs font-bold flex items-center space-x-1.5 transition-all shadow-md cursor-pointer ${
-                isGenerating
+                isGenerating || cooldownSec > 0
                   ? 'bg-slate-800 text-slate-400 cursor-not-allowed border border-slate-700'
                   : 'bg-gradient-to-r from-amber-500 to-orange-600 hover:from-amber-400 hover:to-orange-500 text-slate-950 shadow-amber-500/20 active:scale-95'
               }`}
@@ -758,6 +776,11 @@ export default function App() {
                 <>
                   <span className="w-3.5 h-3.5 border-2 border-slate-950/40 border-t-slate-950 rounded-full animate-spin" />
                   <span>Synthesizing...</span>
+                </>
+              ) : cooldownSec > 0 ? (
+                <>
+                  <Clock className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Wait {cooldownSec}s</span>
                 </>
               ) : (
                 <>
@@ -801,13 +824,32 @@ export default function App() {
           </div>
 
           {/* Direct Master WAV Download CTA */}
-          {fullAudioBase64 && (
+          {fullAudioBase64 ? (
             <button
               onClick={handleDownloadDirectWav}
               className="px-3.5 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs flex items-center justify-center space-x-1.5 shadow-md shadow-emerald-500/20 cursor-pointer transition-all"
             >
               <Download className="w-3.5 h-3.5" />
               <span>Download Master WAV for Video</span>
+            </button>
+          ) : (
+            <button
+              onClick={handleGenerateActiveProject}
+              disabled={isGenerating || cooldownSec > 0}
+              className={`px-3.5 py-2 rounded-xl font-bold text-xs flex items-center justify-center space-x-1.5 shadow-md cursor-pointer transition-all ${
+                isGenerating || cooldownSec > 0
+                  ? 'bg-slate-800 text-slate-400 cursor-not-allowed'
+                  : 'bg-amber-500 hover:bg-amber-400 text-slate-950 shadow-amber-500/20'
+              }`}
+            >
+              <Sparkles className="w-3.5 h-3.5" />
+              <span>
+                {isGenerating
+                  ? 'Generating Timed Audio...'
+                  : cooldownSec > 0
+                  ? `Rate Limit Cooling (${cooldownSec}s)`
+                  : 'Generate AI Voiceover'}
+              </span>
             </button>
           )}
         </div>
@@ -830,7 +872,7 @@ export default function App() {
               </div>
               <p className="text-slate-300 text-[11px] mt-0.5">
                 {projectMode === 'led-video-demo'
-                  ? 'Master WAV includes exact 2-second silences at 0:18–0:20, 0:24–0:26, and 0:28–0:30 so you can drop it straight onto your demo video.'
+                  ? 'Single-request synthesis builds all cues & exact 2-second silences (0:18–0:20, 0:24–0:26, 0:28–0:30) into one video-ready WAV.'
                   : 'Authentic narration calibrated for technical RFID terminology like UHR2, dBm, EPC, and Android 13.'}
               </p>
             </div>
@@ -847,13 +889,26 @@ export default function App() {
           </div>
         </div>
 
-        {/* Error Alert Banner */}
-        {generationError && (
-          <div className="p-3.5 rounded-xl bg-rose-950/60 border border-rose-800 text-rose-200 flex items-start space-x-3 text-xs">
-            <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
-            <div className="flex-1">
-              <span className="font-bold">Generation Notice:</span> {generationError}
+        {/* Error / Cooldown Alert Banner */}
+        {(generationError || cooldownSec > 0) && (
+          <div className="p-3.5 rounded-xl bg-amber-950/60 border border-amber-700/70 text-amber-100 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+            <div className="flex items-start space-x-3">
+              <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+              <div>
+                <span className="font-bold">
+                  {cooldownSec > 0 ? `Rate Limit Cooldown (${cooldownSec}s remaining)` : 'Generation Notice:'}
+                </span>{' '}
+                {generationError}
+              </div>
             </div>
+            {cooldownSec === 0 && (
+              <button
+                onClick={handleGenerateActiveProject}
+                className="px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold shrink-0 cursor-pointer"
+              >
+                Retry Now
+              </button>
+            )}
           </div>
         )}
 

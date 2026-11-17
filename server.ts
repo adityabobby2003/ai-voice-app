@@ -3,12 +3,22 @@ import { createServer as createViteServer } from 'vite';
 import dotenv from 'dotenv';
 import { GoogleGenAI } from '@google/genai';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 
 dotenv.config();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = 3000;
+const CACHE_DIR = '/tmp/uhr2-tts-cache';
+
+try {
+  if (!fs.existsSync(CACHE_DIR)) {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+  }
+} catch {
+  // Ignore if /tmp not writable
+}
 
 const apiKey = process.env.GEMINI_API_KEY;
 let ai: GoogleGenAI | null = null;
@@ -27,7 +37,6 @@ if (apiKey) {
 const app = express();
 app.use(express.json({ limit: '15mb' }));
 
-// Health check endpoint
 app.get('/api/health', (_req: Request, res: Response) => {
   res.json({
     status: 'ok',
@@ -37,8 +46,43 @@ app.get('/api/health', (_req: Request, res: Response) => {
   });
 });
 
-// Audio cache to prevent repeated requests for the same text, voice, and style
+// In-memory + /tmp cache to avoid burning API quota on repeated requests
 const audioCache = new Map<string, string>();
+const timedCache = new Map<string, any>();
+
+function hashKey(input: string): string {
+  let h = 2166136261;
+  for (let i = 0; i < input.length; i++) {
+    h ^= input.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(36);
+}
+
+function getCachedAudio(key: string): string | null {
+  if (audioCache.has(key)) return audioCache.get(key)!;
+  try {
+    const filePath = path.join(CACHE_DIR, `clip_${hashKey(key)}.b64`);
+    if (fs.existsSync(filePath)) {
+      const val = fs.readFileSync(filePath, 'utf8');
+      audioCache.set(key, val);
+      return val;
+    }
+  } catch {
+    // ignore cache read errors
+  }
+  return null;
+}
+
+function setCachedAudio(key: string, val: string): void {
+  audioCache.set(key, val);
+  try {
+    const filePath = path.join(CACHE_DIR, `clip_${hashKey(key)}.b64`);
+    fs.writeFileSync(filePath, val, 'utf8');
+  } catch {
+    // ignore cache write errors
+  }
+}
 
 function getGenAIClient(): GoogleGenAI {
   if (ai) return ai;
@@ -106,7 +150,7 @@ function createWavBuffer(pcm: Buffer, sampleRate = 24000, numChannels = 1, bitsP
   header.write('WAVE', 8);
   header.write('fmt ', 12);
   header.writeUInt32LE(16, 16);
-  header.writeUInt16LE(1, 20); // PCM format
+  header.writeUInt16LE(1, 20);
   header.writeUInt16LE(numChannels, 22);
   header.writeUInt32LE(sampleRate, 24);
   header.writeUInt32LE(byteRate, 28);
@@ -139,7 +183,6 @@ function trimPcmSilence(pcm: Buffer, sampleRate: number, threshold = 180): Buffe
     }
   }
 
-  // Keep 30ms lead-in and 60ms tail padding for natural breath
   const padStartSamples = Math.floor(sampleRate * 0.03);
   const padEndSamples = Math.floor(sampleRate * 0.06);
 
@@ -148,7 +191,6 @@ function trimPcmSilence(pcm: Buffer, sampleRate: number, threshold = 180): Buffe
 
   const trimmed = Buffer.from(pcm.subarray(startSample * 2, (endSample + 1) * 2));
 
-  // Gentle 8ms fade-in/out to prevent clicks
   const fadeSamples = Math.min(Math.floor(sampleRate * 0.008), Math.floor(trimmed.length / 4));
   for (let i = 0; i < fadeSamples; i++) {
     const gain = i / fadeSamples;
@@ -163,6 +205,184 @@ function trimPcmSilence(pcm: Buffer, sampleRate: number, threshold = 180): Buffe
   return trimmed;
 }
 
+/**
+ * Splits a single synthesized PCM track containing N pause-separated cues
+ * into N individual PCM clips using Dynamic Programming over silent valleys,
+ * matching active speech duration of each segment to each cue's word weight.
+ * Uses only 1 API call instead of N calls, staying safely within free-tier RPM limits.
+ */
+function splitPcmIntoCues(
+  pcm: Buffer,
+  sampleRate: number,
+  expectedCount: number,
+  wordCounts: number[]
+): Buffer[] {
+  if (expectedCount <= 1) {
+    return [trimPcmSilence(pcm, sampleRate)];
+  }
+
+  const totalSamples = Math.floor(pcm.length / 2);
+  const frameMs = 20;
+  const frameSamples = Math.floor((sampleRate * frameMs) / 1000);
+  const totalFrames = Math.floor(totalSamples / frameSamples);
+
+  if (totalFrames < expectedCount * 4) {
+    return [trimPcmSilence(pcm, sampleRate)];
+  }
+
+  // Compute RMS energy per 20ms frame
+  const frameRms: number[] = new Array(totalFrames);
+  for (let f = 0; f < totalFrames; f++) {
+    let sumSq = 0;
+    const startSample = f * frameSamples;
+    for (let s = 0; s < frameSamples; s++) {
+      const v = pcm.readInt16LE((startSample + s) * 2);
+      sumSq += v * v;
+    }
+    frameRms[f] = Math.sqrt(sumSq / frameSamples);
+  }
+
+  const silenceThreshold = 260;
+  let firstSpeechFrame = 0;
+  let lastSpeechFrame = totalFrames - 1;
+  while (firstSpeechFrame < totalFrames && frameRms[firstSpeechFrame] < silenceThreshold) {
+    firstSpeechFrame++;
+  }
+  while (lastSpeechFrame > firstSpeechFrame && frameRms[lastSpeechFrame] < silenceThreshold) {
+    lastSpeechFrame--;
+  }
+
+  // Prefix sum of active (non-silent) frames for O(1) active-duration lookup
+  const activePrefix = new Int32Array(totalFrames + 1);
+  for (let f = 0; f < totalFrames; f++) {
+    activePrefix[f + 1] = activePrefix[f] + (frameRms[f] >= silenceThreshold ? 1 : 0);
+  }
+  const totalActiveFrames = Math.max(1, activePrefix[lastSpeechFrame + 1] - activePrefix[firstSpeechFrame]);
+
+  // Detect candidate silent valleys (>= 5 frames = 100ms)
+  interface CandidateSplit {
+    frame: number;
+    valleyBonus: number;
+  }
+
+  const candidates: CandidateSplit[] = [{ frame: firstSpeechFrame, valleyBonus: 0 }];
+  let inSilence = false;
+  let silenceStart = 0;
+
+  for (let f = firstSpeechFrame; f <= lastSpeechFrame; f++) {
+    if (frameRms[f] < silenceThreshold) {
+      if (!inSilence) {
+        inSilence = true;
+        silenceStart = f;
+      }
+    } else if (inSilence) {
+      const len = f - silenceStart;
+      if (len >= 5) {
+        const mid = Math.floor((silenceStart + f - 1) / 2);
+        // Longer pauses get stronger bonus (preferred split boundaries)
+        const bonus = Math.min(0.6, len * 0.025);
+        candidates.push({ frame: mid, valleyBonus: bonus });
+      }
+      inSilence = false;
+    }
+  }
+
+  // If very few valleys exist, add local energy minima every ~25 frames as fallback candidates
+  if (candidates.length < expectedCount + 2) {
+    for (let f = firstSpeechFrame + 15; f < lastSpeechFrame - 15; f += 25) {
+      let minF = f;
+      let minRms = Infinity;
+      for (let k = Math.max(firstSpeechFrame + 5, f - 10); k <= Math.min(lastSpeechFrame - 5, f + 10); k++) {
+        if (frameRms[k] < minRms) {
+          minRms = frameRms[k];
+          minF = k;
+        }
+      }
+      if (!candidates.some((c) => Math.abs(c.frame - minF) < 8)) {
+        candidates.push({ frame: minF, valleyBonus: 0 });
+      }
+    }
+    candidates.sort((a, b) => a.frame - b.frame);
+  }
+
+  candidates.push({ frame: lastSpeechFrame + 1, valleyBonus: 0 });
+  const M = candidates.length;
+
+  // Expected active frames per cue based on word counts (+1.5 word base weight for short phrases)
+  const weights = wordCounts.map((w) => Math.max(1, w) + 1.5);
+  const totalWeight = weights.reduce((a, b) => a + b, 0);
+  const expectedActive = weights.map((w) => (w / totalWeight) * totalActiveFrames);
+
+  // DP: dp[i][j] = min cost to assign cues 0..i-1 ending at candidate j
+  const INF = 1e12;
+  const dp: number[][] = Array.from({ length: expectedCount + 1 }, () => new Array(M).fill(INF));
+  const parent: number[][] = Array.from({ length: expectedCount + 1 }, () => new Array(M).fill(-1));
+  dp[0][0] = 0;
+
+  for (let i = 1; i <= expectedCount; i++) {
+    const expAct = expectedActive[i - 1];
+    for (let j = i; j < M - (expectedCount - i); j++) {
+      const endFrame = candidates[j].frame;
+      for (let prev = i - 1; prev < j; prev++) {
+        if (dp[i - 1][prev] >= INF) continue;
+        const startFrame = candidates[prev].frame;
+        const act = activePrefix[endFrame] - activePrefix[startFrame];
+        if (act < 4) continue; // At least 80ms of actual speech
+
+        const relErr = (act - expAct) / Math.max(12, expAct);
+        const cost = dp[i - 1][prev] + relErr * relErr - candidates[j].valleyBonus;
+        if (cost < dp[i][j]) {
+          dp[i][j] = cost;
+          parent[i][j] = prev;
+        }
+      }
+    }
+  }
+
+  // Backtrack optimal boundaries from final candidate (M - 1)
+  const chosenIndices = new Array(expectedCount + 1).fill(0);
+  chosenIndices[expectedCount] = M - 1;
+  for (let i = expectedCount; i >= 1; i--) {
+    const p = parent[i][chosenIndices[i]];
+    chosenIndices[i - 1] = p >= 0 ? p : Math.max(0, i - 1);
+  }
+
+  const segments: Buffer[] = [];
+  for (let i = 0; i < expectedCount; i++) {
+    const startFrame = i === 0 ? 0 : candidates[chosenIndices[i]].frame;
+    const endFrame = i === expectedCount - 1 ? totalFrames : candidates[chosenIndices[i + 1]].frame;
+    const startByte = startFrame * frameSamples * 2;
+    const endByte = Math.min(pcm.length, endFrame * frameSamples * 2);
+    const slice = Buffer.from(pcm.subarray(startByte, Math.max(startByte, endByte)));
+    segments.push(trimPcmSilence(slice, sampleRate));
+  }
+
+  return segments;
+}
+
+function parseApiError(error: any): { status: number; message: string; retryAfterSec?: number } {
+  const rawMsg = error?.message || String(error || 'Unknown error');
+  let retryAfterSec: number | undefined;
+
+  const retryMatch = rawMsg.match(/retry in\s+([\d.]+)s/i) || rawMsg.match(/"retryDelay"\s*:\s*"(\d+)s"/i);
+  if (retryMatch) {
+    retryAfterSec = Math.ceil(parseFloat(retryMatch[1]));
+  }
+
+  if (rawMsg.includes('429') || rawMsg.includes('RESOURCE_EXHAUSTED') || rawMsg.includes('quota')) {
+    return {
+      status: 429,
+      retryAfterSec: retryAfterSec || 30,
+      message: `Gemini TTS rate limit reached (Free Tier allows 3 requests/minute). Please wait ${retryAfterSec || 30}s before regenerating.`,
+    };
+  }
+
+  return {
+    status: error?.status || 500,
+    message: rawMsg,
+  };
+}
+
 async function synthesizeClipBase64(
   text: string,
   voiceName: string,
@@ -170,7 +390,7 @@ async function synthesizeClipBase64(
   model = 'gemini-3.8-flash-lite-tts'
 ): Promise<string> {
   const cacheKey = `${model}_${voiceName}_${stylePrompt}_${text.trim()}`;
-  const cached = audioCache.get(cacheKey);
+  const cached = getCachedAudio(cacheKey);
   if (cached) return cached;
 
   const client = getGenAIClient();
@@ -208,11 +428,11 @@ async function synthesizeClipBase64(
     throw new Error(`No audio data received from Gemini TTS (${response.candidates?.[0]?.finishReason || 'unknown'})`);
   }
 
-  audioCache.set(cacheKey, base64Audio);
+  setCachedAudio(cacheKey, base64Audio);
   return base64Audio;
 }
 
-// Single TTS Generation Endpoint using Gemini 3.8 Flash-Lite TTS
+// Single TTS Generation Endpoint
 app.post('/api/tts/generate', async (req: Request, res: Response) => {
   try {
     const { text, voiceName = 'Kore', style, accent = 'indian', model = 'gemini-3.8-flash-lite-tts' } = req.body;
@@ -244,8 +464,10 @@ app.post('/api/tts/generate', async (req: Request, res: Response) => {
     });
   } catch (error: any) {
     console.error('TTS Generation error:', error);
-    res.status(500).json({
-      error: error.message || 'Failed to generate speech with Gemini TTS',
+    const parsedErr = parseApiError(error);
+    res.status(parsedErr.status).json({
+      error: parsedErr.message,
+      retryAfterSec: parsedErr.retryAfterSec,
     });
   }
 });
@@ -258,7 +480,7 @@ interface TimedCueInput {
   text?: string;
 }
 
-// Timed Multi-Cue Voiceover Stitching Endpoint for Video Synchronization
+// Timed Multi-Cue Voiceover Stitching Endpoint (Single-Request Batch Synthesis!)
 app.post('/api/tts/generate-timed', async (req: Request, res: Response) => {
   try {
     const {
@@ -267,14 +489,12 @@ app.post('/api/tts/generate-timed', async (req: Request, res: Response) => {
       style,
       accent = 'indian',
       model = 'gemini-3.8-flash-lite-tts',
-      trimSilence = true,
     } = req.body as {
       cues: TimedCueInput[];
       voiceName?: string;
       style?: string;
       accent?: string;
       model?: string;
-      trimSilence?: boolean;
     };
 
     if (!Array.isArray(cues) || cues.length === 0) {
@@ -289,46 +509,40 @@ app.post('/api/tts/generate-timed', async (req: Request, res: Response) => {
       return;
     }
 
+    const timedKey = JSON.stringify({ cues, voiceName, style, accent, model });
+    if (timedCache.has(timedKey)) {
+      res.json(timedCache.get(timedKey));
+      return;
+    }
+
     let baseStyle =
       style ||
       (accent === 'indian'
         ? 'Professional Indian English speaker with an authentic, articulate Indian accent and crisp pronunciation of hardware terms like UHR2, RFID, and LED.'
         : 'Clear, professional product demo narrator with crisp pronunciation of UHR2, RFID, and LED.');
 
-    // Generate each speech cue with bounded concurrency (3 at a time)
     const speechCues = cues.filter((c) => c.type === 'speech' && c.text && c.text.trim().length > 0);
-    const clipResults = new Map<string, { pcm: Buffer; wavBase64: string; sampleRate: number }>();
 
-    const concurrency = 3;
-    for (let i = 0; i < speechCues.length; i += concurrency) {
-      const batch = speechCues.slice(i, i + concurrency);
-      await Promise.all(
-        batch.map(async (cue) => {
-          const slotSec = Math.max(0.8, cue.endSec - cue.startSec);
-          const pacingHint =
-            slotSec <= 1.5
-              ? 'Deliver briskly and cleanly within 1 second.'
-              : slotSec <= 3.5
-              ? `Deliver concisely within ${slotSec} seconds.`
-              : `Deliver naturally and clearly, fitting comfortably within ${slotSec} seconds.`;
+    // Combine all speech cues into ONE single Gemini TTS call separated by pauses!
+    // This reduces API calls from 7 down to 1 so Free Tier (3 RPM) is respected.
+    const combinedPrompt = speechCues.map((c) => c.text!.trim()).join('\n\n...\n\n');
+    const batchStyle = `${baseStyle} Speak each paragraph clearly with a distinct 1.5 second silent pause between paragraphs.`;
 
-          const cueStyle = `${baseStyle} ${pacingHint}`;
-          const rawB64 = await synthesizeClipBase64(cue.text!, voiceName, cueStyle, model);
-          const parsed = parseWav(Buffer.from(rawB64, 'base64'));
-          const processedPcm = trimSilence ? trimPcmSilence(parsed.pcm, parsed.sampleRate) : parsed.pcm;
-          const processedWavB64 = createWavBuffer(processedPcm, parsed.sampleRate, parsed.numChannels, parsed.bitsPerSample).toString('base64');
+    const rawCombinedB64 = await synthesizeClipBase64(combinedPrompt, voiceName, batchStyle, model);
+    const parsed = parseWav(Buffer.from(rawCombinedB64, 'base64'));
 
-          clipResults.set(cue.id, {
-            pcm: processedPcm,
-            wavBase64: processedWavB64,
-            sampleRate: parsed.sampleRate,
-          });
-        })
-      );
-    }
+    const wordCounts = speechCues.map((c) => c.text!.trim().split(/\s+/).filter(Boolean).length);
+    const splitPcms = splitPcmIntoCues(parsed.pcm, parsed.sampleRate, speechCues.length, wordCounts);
 
-    // Assemble master timeline at 24kHz mono 16-bit
-    const sampleRate = 24000;
+    const clipMap = new Map<string, { pcm: Buffer; wavBase64: string }>();
+    speechCues.forEach((cue, idx) => {
+      const segPcm = splitPcms[idx] || Buffer.alloc(0);
+      const segWavB64 = createWavBuffer(segPcm, parsed.sampleRate, parsed.numChannels, parsed.bitsPerSample).toString('base64');
+      clipMap.set(cue.id, { pcm: segPcm, wavBase64: segWavB64 });
+    });
+
+    // Assemble master timeline at parsed sample rate (24kHz mono 16-bit)
+    const sampleRate = parsed.sampleRate || 24000;
     let cursorSec = 0;
     const placements: Array<{
       id: string;
@@ -357,10 +571,9 @@ app.post('/api/tts/generate-timed', async (req: Request, res: Response) => {
         });
         cursorSec = end;
       } else {
-        const clip = clipResults.get(cue.id);
+        const clip = clipMap.get(cue.id);
         if (!clip) continue;
         const clipDurationSec = clip.pcm.length / (sampleRate * 2);
-        // Start at target startSec, or right after previous speech + 80ms gap if previous slightly ran over
         const actualStart = Math.max(cue.startSec, cursorSec > cue.startSec ? cursorSec + 0.08 : cue.startSec);
         const actualEnd = actualStart + clipDurationSec;
 
@@ -396,16 +609,21 @@ app.post('/api/tts/generate-timed', async (req: Request, res: Response) => {
 
     const masterWavBase64 = createWavBuffer(masterPcm, sampleRate, 1, 16).toString('base64');
 
-    res.json({
+    const resultPayload = {
       audioBase64: masterWavBase64,
       mimeType: 'audio/wav',
       totalDurationSec: Number(totalDurationSec.toFixed(3)),
       cueTimings: placements.map(({ pcm: _pcm, ...rest }) => rest),
-    });
+    };
+
+    timedCache.set(timedKey, resultPayload);
+    res.json(resultPayload);
   } catch (error: any) {
     console.error('Timed TTS Generation error:', error);
-    res.status(500).json({
-      error: error.message || 'Failed to generate timed speech',
+    const parsedErr = parseApiError(error);
+    res.status(parsedErr.status).json({
+      error: parsedErr.message,
+      retryAfterSec: parsedErr.retryAfterSec,
     });
   }
 });
