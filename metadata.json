@@ -1,0 +1,6 @@
+{
+  "name": "UHR2 Handheld Reader AI Voice Studio",
+  "description": "Generate studio-grade AI speech narration and interactive demonstration for the UHR2 Handheld RFID Reader with multi-voice synthesis, synchronized device visualizer, and export options.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
