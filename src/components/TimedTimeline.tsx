@@ -1,3 +1,4 @@
+import { downloadAsMp3 } from '../utils/mp3';
 import React, { useState } from 'react';
 import {
   Play,
@@ -76,12 +77,7 @@ export const TimedTimeline: React.FC<TimedTimelineProps> = ({
   };
 
   const handleDownloadSingleClip = (cue: TimedCue, wavBase64: string) => {
-    const link = document.createElement('a');
-    link.href = `data:audio/wav;base64,${wavBase64}`;
-    link.download = `UHR2_Cue_${cue.stepNumber}_${formatClock(cue.startSec).replace(':', '-')}_${voiceName}.wav`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+    downloadAsMp3(wavBase64, `UHR2_Cue_${cue.stepNumber}_${formatClock(cue.startSec).replace(':', '-')}_${voiceName}.wav`);
   };
 
   const totalEndSec = cues[cues.length - 1]?.endSec || 42;
@@ -249,7 +245,7 @@ export const TimedTimeline: React.FC<TimedTimelineProps> = ({
                           handleDownloadSingleClip(cue, timing.wavBase64!);
                         }}
                         className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-amber-400 hover:text-amber-300 border border-slate-700/60"
-                        title="Download this individual clip (.wav)"
+                        title="Download this individual clip (.mp3)"
                       >
                         <Download className="w-3.5 h-3.5" />
                       </button>

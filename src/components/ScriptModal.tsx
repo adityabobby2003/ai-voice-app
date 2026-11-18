@@ -1,12 +1,13 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { X, RotateCcw, Check, Sparkles, FileEdit, Volume2 } from 'lucide-react';
-import { FULL_DEFAULT_SCRIPT } from '../data/scriptData';
+import { FULL_DEFAULT_SCRIPT, DEFAULT_TIMED_SCRIPT } from '../data/scriptData';
 
 interface ScriptModalProps {
   isOpen: boolean;
   onClose: () => void;
   scriptText: string;
-  onSaveScript: (newScript: string) => void;
+  onSaveScript: (newScript: string) => boolean | void;
+  isTimed?: boolean;
   onResetScript: () => void;
 }
 
@@ -16,9 +17,15 @@ export const ScriptModal: React.FC<ScriptModalProps> = ({
   scriptText,
   onSaveScript,
   onResetScript,
+  isTimed = false,
 }) => {
   const [editedText, setEditedText] = useState(scriptText);
   const [saved, setSaved] = useState(false);
+
+  // Reload the current script every time the editor opens
+  useEffect(() => {
+    if (isOpen) setEditedText(scriptText);
+  }, [isOpen, scriptText]);
 
   if (!isOpen) return null;
 
@@ -30,7 +37,7 @@ export const ScriptModal: React.FC<ScriptModalProps> = ({
   const estSecs = estimatedSeconds % 60;
 
   const handleSave = () => {
-    onSaveScript(editedText);
+    if (onSaveScript(editedText) === false) return;
     setSaved(true);
     setTimeout(() => {
       setSaved(false);
@@ -39,7 +46,7 @@ export const ScriptModal: React.FC<ScriptModalProps> = ({
   };
 
   const handleReset = () => {
-    setEditedText(FULL_DEFAULT_SCRIPT);
+    setEditedText(isTimed ? DEFAULT_TIMED_SCRIPT : FULL_DEFAULT_SCRIPT);
     onResetScript();
   };
 
@@ -53,7 +60,9 @@ export const ScriptModal: React.FC<ScriptModalProps> = ({
             <div>
               <h3 className="text-base font-bold text-white">Edit Demonstration Script</h3>
               <p className="text-xs text-slate-400">
-                Customize the narrator's text before generating AI speech
+                {isTimed
+                  ? 'One line per cue: 0:00-0:05 | text. Gaps between times become silence.'
+                  : "Customize the narrator's text before generating AI speech"}
               </p>
             </div>
           </div>
@@ -80,7 +89,7 @@ export const ScriptModal: React.FC<ScriptModalProps> = ({
             onChange={(e) => setEditedText(e.target.value)}
             rows={14}
             className="w-full flex-1 p-3.5 bg-slate-950 border border-slate-800 rounded-xl text-slate-100 font-sans text-sm leading-relaxed resize-none focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500"
-            placeholder="Type or paste narration script here..."
+            placeholder={isTimed ? "0:00-0:05 | This is our reader.\n0:07-0:12 | Next line after a 2s pause." : "Type or paste narration script here..."}
           />
         </div>
 

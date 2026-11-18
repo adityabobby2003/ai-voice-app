@@ -489,7 +489,9 @@ app.post('/api/tts/generate-timed', async (req: Request, res: Response) => {
       style,
       accent = 'indian',
       model = 'gemini-3.8-flash-lite-tts',
+      tightFlow = false,
     } = req.body as {
+      tightFlow?: boolean;
       cues: TimedCueInput[];
       voiceName?: string;
       style?: string;
@@ -509,7 +511,7 @@ app.post('/api/tts/generate-timed', async (req: Request, res: Response) => {
       return;
     }
 
-    const timedKey = JSON.stringify({ cues, voiceName, style, accent, model });
+    const timedKey = JSON.stringify({ cues, voiceName, style, accent, model, tightFlow });
     if (timedCache.has(timedKey)) {
       res.json(timedCache.get(timedKey));
       return;
@@ -556,6 +558,7 @@ app.post('/api/tts/generate-timed', async (req: Request, res: Response) => {
       wavBase64?: string;
     }> = [];
 
+    let lastSpeechEnd = null as number | null;
     for (const cue of cues) {
       if (cue.type === 'silence' || !cue.text?.trim()) {
         const start = Math.max(cursorSec, cue.startSec);
@@ -574,8 +577,12 @@ app.post('/api/tts/generate-timed', async (req: Request, res: Response) => {
         const clip = clipMap.get(cue.id);
         if (!clip) continue;
         const clipDurationSec = clip.pcm.length / (sampleRate * 2);
-        const actualStart = Math.max(cue.startSec, cursorSec > cue.startSec ? cursorSec + 0.08 : cue.startSec);
-        const actualEnd = actualStart + clipDurationSec;
+        // Tight flow: each line follows the previous one after a short breath (no dead air).
+        // Timed: each line starts at its own timestamp (or just after the previous line if that ran long).
+        const actualStart: number = tightFlow
+          ? (lastSpeechEnd === null ? cue.startSec : lastSpeechEnd + 0.4)
+          : Math.max(cue.startSec, cursorSec > cue.startSec ? cursorSec + 0.08 : cue.startSec);
+        const actualEnd: number = actualStart + clipDurationSec;
 
         placements.push({
           id: cue.id,
@@ -590,6 +597,7 @@ app.post('/api/tts/generate-timed', async (req: Request, res: Response) => {
         });
 
         cursorSec = Math.max(actualEnd, cue.endSec);
+        lastSpeechEnd = actualEnd;
       }
     }
 

@@ -1,3 +1,4 @@
+import { downloadAsMp3 } from './utils/mp3';
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
@@ -22,6 +23,9 @@ import {
   FULL_DEFAULT_SCRIPT,
   HINDI_DEFAULT_SCRIPT,
   LED_DEMO_CUES,
+  DEFAULT_TIMED_SCRIPT,
+  cuesToScript,
+  scriptToCues,
   SCRIPT_SEGMENTS,
   ScriptSegment,
   TimedCue,
@@ -51,7 +55,8 @@ export default function App() {
   const [languageMode, setLanguageMode] = useState<'en' | 'hi'>('en');
 
   // Script & Cues state
-  const [timedCues, setTimedCues] = useState<TimedCue[]>(LED_DEMO_CUES);
+  const [tightFlow, setTightFlow] = useState<boolean>(true);
+  const [timedCues, setTimedCues] = useState<TimedCue[]>(() => scriptToCues(DEFAULT_TIMED_SCRIPT));
   const [scriptText, setScriptText] = useState<string>(FULL_DEFAULT_SCRIPT);
   const [segments] = useState<ScriptSegment[]>(SCRIPT_SEGMENTS);
 
@@ -249,6 +254,7 @@ export default function App() {
           voiceName: activeVoice.baseVoice,
           style: instruction,
           accent: activeVoice.accent.toLowerCase(),
+          tightFlow,
         }),
       });
 
@@ -663,15 +669,9 @@ export default function App() {
 
   const handleDownloadDirectWav = () => {
     if (!fullAudioBase64) return;
-    const link = document.createElement('a');
-    link.href = `data:audio/wav;base64,${fullAudioBase64}`;
-    link.download =
-      projectMode === 'led-video-demo'
+    downloadAsMp3(fullAudioBase64, projectMode === 'led-video-demo'
         ? `UHR2_LED_Demo_Timed_Master_${selectedVoice.name}.wav`
-        : `UHR2_Handheld_Reader_Demo_${selectedVoice.name}.wav`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+        : `UHR2_Handheld_Reader_Demo_${selectedVoice.name}.wav`);
   };
 
   // Do not auto-consume TTS API quota on mount; user clicks Generate Voice or Play Narration on demand.
@@ -744,7 +744,7 @@ export default function App() {
               </div>
             )}
 
-            {projectMode === 'full-walkthrough' && (
+            {(
               <button
                 onClick={() => setIsScriptModalOpen(true)}
                 className="px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 flex items-center space-x-1.5 transition-colors cursor-pointer"
@@ -757,7 +757,7 @@ export default function App() {
             <button
               onClick={() => setIsExportModalOpen(true)}
               className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 flex items-center space-x-1.5 transition-colors cursor-pointer"
-              title="Export WAV audio, individual clips, and SRT subtitles"
+              title="Export MP3 audio, individual clips, and SRT subtitles"
             >
               <Download className="w-3.5 h-3.5 text-amber-400" />
               <span>Export</span>
@@ -830,7 +830,7 @@ export default function App() {
               className="px-3.5 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs flex items-center justify-center space-x-1.5 shadow-md shadow-emerald-500/20 cursor-pointer transition-all"
             >
               <Download className="w-3.5 h-3.5" />
-              <span>Download Master WAV for Video</span>
+              <span>Download MP3 for Video</span>
             </button>
           ) : (
             <button
@@ -872,13 +872,27 @@ export default function App() {
               </div>
               <p className="text-slate-300 text-[11px] mt-0.5">
                 {projectMode === 'led-video-demo'
-                  ? 'Single-request synthesis builds all cues & exact 2-second silences (0:18–0:20, 0:24–0:26, 0:28–0:30) into one video-ready WAV.'
+                  ? 'Builds all cues at their timestamps, with silence in the gaps, into one video-ready WAV. Use Edit Script to change the lines and timings.'
                   : 'Authentic narration calibrated for technical RFID terminology like UHR2, dBm, EPC, and Android 13.'}
               </p>
             </div>
           </div>
 
           <div className="flex items-center space-x-2 shrink-0">
+            <label
+              className="px-3 py-1.5 rounded-lg bg-slate-800 border border-slate-700 text-slate-200 text-xs flex items-center space-x-1.5 cursor-pointer"
+              title="On: lines flow back-to-back with a short breath (no dead air). Off: each line starts exactly at its timestamp."
+            >
+              <input
+                type="checkbox"
+                checked={tightFlow}
+                onChange={(e) => {
+                  setTightFlow(e.target.checked);
+                  setFullAudioBase64(null);
+                }}
+              />
+              <span>No gaps</span>
+            </label>
             <button
               onClick={() => setActiveTab('voice')}
               className="px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs flex items-center space-x-1 cursor-pointer transition-colors"
@@ -1178,7 +1192,7 @@ export default function App() {
                 </div>
               </div>
 
-              {projectMode === 'full-walkthrough' && (
+              {(
                 <button
                   onClick={() => setIsScriptModalOpen(true)}
                   className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 flex items-center space-x-1 cursor-pointer"
@@ -1259,14 +1273,31 @@ export default function App() {
       <ScriptModal
         isOpen={isScriptModalOpen}
         onClose={() => setIsScriptModalOpen(false)}
-        scriptText={scriptText}
+        isTimed={projectMode === 'led-video-demo'}
+        scriptText={projectMode === 'led-video-demo' ? cuesToScript(timedCues) : scriptText}
         onSaveScript={(newText) => {
-          setScriptText(newText);
+          if (projectMode === 'led-video-demo') {
+            try {
+              setTimedCues(scriptToCues(newText, timedCues));
+            } catch (e: any) {
+              alert(e.message);
+              return false;
+            }
+            setCueTimingsMap({});
+            setActiveCueIndex(0);
+          } else {
+            setScriptText(newText);
+          }
           setFullAudioBase64(null);
           setSegmentAudioMap({});
         }}
         onResetScript={() => {
-          setScriptText(languageMode === 'hi' ? HINDI_DEFAULT_SCRIPT : FULL_DEFAULT_SCRIPT);
+          if (projectMode === 'led-video-demo') {
+            setTimedCues(scriptToCues(DEFAULT_TIMED_SCRIPT));
+            setCueTimingsMap({});
+          } else {
+            setScriptText(languageMode === 'hi' ? HINDI_DEFAULT_SCRIPT : FULL_DEFAULT_SCRIPT);
+          }
           setFullAudioBase64(null);
           setSegmentAudioMap({});
         }}

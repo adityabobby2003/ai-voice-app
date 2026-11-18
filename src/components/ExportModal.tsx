@@ -1,3 +1,4 @@
+import { downloadAsMp3 } from '../utils/mp3';
 import React, { useState } from 'react';
 import { X, Download, FileText, Check, Copy, Film, Layers } from 'lucide-react';
 import { ScriptSegment, TimedCue } from '../data/scriptData';
@@ -44,14 +45,9 @@ export const ExportModal: React.FC<ExportModalProps> = ({
   // Download complete WAV audio
   const handleDownloadWav = () => {
     if (!fullAudioBase64) return;
-    const link = document.createElement('a');
-    link.href = `data:audio/wav;base64,${fullAudioBase64}`;
-    link.download = isTimedMode
+    downloadAsMp3(fullAudioBase64, isTimedMode
       ? `UHR2_LED_Demo_Timed_Master_${currentVoice}.wav`
-      : `UHR2_Handheld_Reader_Demo_${currentVoice}.wav`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+      : `UHR2_Handheld_Reader_Demo_${currentVoice}.wav`);
   };
 
   // Generate SRT Subtitles
@@ -152,7 +148,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
           <div className="p-3.5 rounded-xl bg-slate-950/80 border border-slate-800 flex items-center justify-between gap-3">
             <div>
               <h4 className="text-sm font-bold text-white flex flex-wrap items-center gap-2">
-                <span>{isTimedMode ? 'Timed Master Track (.WAV)' : 'Studio Audio (.WAV)'}</span>
+                <span>{isTimedMode ? 'Timed Master Track (.MP3)' : 'Studio Audio (.MP3)'}</span>
                 <span className="text-[10px] px-2 py-0.5 rounded bg-sky-500/20 text-sky-400 font-mono">
                   24kHz Mono 16-bit
                 </span>
@@ -173,7 +169,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
               }`}
             >
               <Download className="w-3.5 h-3.5" />
-              <span>{fullAudioBase64 ? 'Download WAV' : 'Not Generated'}</span>
+              <span>{fullAudioBase64 ? 'Download MP3' : 'Not Generated'}</span>
             </button>
           </div>
 
@@ -194,12 +190,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                     <button
                       key={cue.id}
                       onClick={() => {
-                        const link = document.createElement('a');
-                        link.href = `data:audio/wav;base64,${timing.wavBase64}`;
-                        link.download = `UHR2_Cue_${cue.stepNumber}_${currentVoice}.wav`;
-                        document.body.appendChild(link);
-                        link.click();
-                        document.body.removeChild(link);
+                        downloadAsMp3(timing.wavBase64!, `UHR2_Cue_${cue.stepNumber}_${currentVoice}.wav`);
                       }}
                       className="flex items-center justify-between p-2 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 text-left text-[11px] cursor-pointer"
                     >

@@ -537,3 +537,50 @@ export const DEMO_EPC_TAGS: MockEpcTag[] = [
   { epc: 'E280 1170 2000 0001 5522 9980', rssi: -59, count: 26, tid: 'E2003412055' },
   { epc: 'E280 1170 2000 0001 5522 9981', rssi: -65, count: 14, tid: 'E2003412056' },
 ];
+
+// ---------- Editable timed script (one line per cue: "0:00-0:05 | text") ----------
+export const DEFAULT_TIMED_SCRIPT = `0:00-0:05 | Meet the UHR2, our handheld RFID reader, built for fast and accurate tag reading.
+0:05-0:13 | And this is our LED tag. Whenever the reader detects it, the LED lights up, so you can instantly see which tag was read.
+0:13-0:22 | This is our waterproof LED tag. It works exactly the same way, but it's sealed for use in water, outdoors, and other wet environments.
+0:22-0:28 | Now let's move to the live demo. First, a quick look at the reader settings.
+0:28-0:36 | Here are the reader settings. You can adjust options like read power to match your application, your tags, and your working environment.
+0:36-0:50 | Now let's open the menu and start reading. As you can see, the reader picks up the tags right away, and the LED on each tag blinks with every successful read, so you can confirm every scan at a glance.
+0:50-1:01 | That's the UHR2 with our LED tags: fast, reliable reading that you can actually see. To learn more or request a demo for your business, contact our team today.`;
+
+const toSec = (t: string) => t.split(':').reduce((a, v) => a * 60 + parseFloat(v), 0);
+const fmt = (s: number) => {
+  const m = Math.floor(s / 60);
+  const r = +(s - m * 60).toFixed(2);
+  return `${m}:${r < 10 ? '0' : ''}${r}`;
+};
+
+export function cuesToScript(cues: TimedCue[]): string {
+  return cues
+    .filter((c) => c.type === 'speech')
+    .map((c) => `${fmt(c.startSec)}-${fmt(c.endSec)} | ${c.text}`)
+    .join('\n');
+}
+
+/** Parses "start-end | text" lines into cues. Gaps between lines are silence. Throws on a bad line. */
+export function scriptToCues(script: string, previous: TimedCue[] = LED_DEMO_CUES): TimedCue[] {
+  const prevSpeech = previous.filter((c) => c.type === 'speech');
+  const lines = script.split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith('#'));
+  return lines.map((line, i) => {
+    const m = line.match(/^([\d:.]+)\s*-\s*([\d:.]+)\s*\|\s*(.+)$/);
+    if (!m) throw new Error(`Line ${i + 1} must look like "0:00-0:05 | text":\n${line}`);
+    const startSec = toSec(m[1]);
+    const endSec = toSec(m[2]);
+    if (!(endSec > startSec)) throw new Error(`Line ${i + 1}: end time must be after start time.`);
+    const text = m[3].trim();
+    return {
+      id: `cue-${i + 1}`,
+      stepNumber: i + 1,
+      type: 'speech',
+      startSec,
+      endSec,
+      title: text.split(/\s+/).slice(0, 5).join(' '),
+      text,
+      deviceView: prevSpeech[i]?.deviceView ?? 'overview',
+    };
+  });
+}
